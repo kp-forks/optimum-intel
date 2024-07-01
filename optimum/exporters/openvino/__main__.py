@@ -13,19 +13,20 @@
 #  limitations under the License.
 
 import logging
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
+from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase
 
 from optimum.exporters import TasksManager
 from optimum.exporters.onnx.base import OnnxConfig
 from optimum.exporters.onnx.constants import SDPA_ARCHS_ONNX_EXPORT_NOT_SUPPORTED
+from optimum.exporters.openvino.convert import export_from_model
+from optimum.intel.utils.import_utils import is_openvino_tokenizers_available, is_transformers_version
 from optimum.utils.save_utils import maybe_load_preprocessors
-
-from ...intel.utils.import_utils import is_openvino_tokenizers_available, is_transformers_version
-from .convert import export_from_model, export_tokenizer
 
 
 if TYPE_CHECKING:
@@ -43,13 +44,29 @@ _COMPRESSION_OPTIONS = {
 logger = logging.getLogger(__name__)
 
 
+def infer_task(task, model_name_or_path):
+    task = TasksManager.map_from_synonym(task)
+    if task == "auto":
+        try:
+            task = TasksManager.infer_task_from_model(model_name_or_path)
+        except KeyError as e:
+            raise KeyError(
+                f"The task could not be automatically inferred. Please provide the argument --task with the relevant task from {', '.join(TasksManager.get_all_tasks())}. Detailed error: {e}"
+            )
+        except RequestsConnectionError as e:
+            raise RequestsConnectionError(
+                f"The task could not be automatically inferred as this is available only for models hosted on the Hugging Face Hub. Please provide the argument --task with the relevant task from {', '.join(TasksManager.get_all_tasks())}. Detailed error: {e}"
+            )
+    return task
+
+
 def main_export(
     model_name_or_path: str,
     output: Union[str, Path],
     task: str = "auto",
     device: str = "cpu",
     framework: Optional[str] = None,
-    cache_dir: Optional[str] = None,
+    cache_dir: str = HUGGINGFACE_HUB_CACHE,
     trust_remote_code: bool = False,
     pad_token_id: Optional[int] = None,
     subfolder: str = "",
@@ -57,6 +74,7 @@ def main_export(
     force_download: bool = False,
     local_files_only: bool = False,
     use_auth_token: Optional[Union[bool, str]] = None,
+    token: Optional[Union[bool, str]] = None,
     model_kwargs: Optional[Dict[str, Any]] = None,
     custom_export_configs: Optional[Dict[str, "OnnxConfig"]] = None,
     fn_get_submodels: Optional[Callable] = None,
@@ -77,7 +95,7 @@ def main_export(
         model_name_or_path (`str`):
             Model ID on huggingface.co or path on disk to the model repository to export.
         output (`Union[str, Path]`):
-            Path indicating the directory where to store the generated ONNX model.
+            Path indicating the directory where to store the generated OpenVINO model.
 
         > Optional parameters
 
@@ -107,9 +125,11 @@ def main_export(
             cached versions if they exist.
         local_files_only (`Optional[bool]`, defaults to `False`):
             Whether or not to only look at local files (i.e., do not try to download the model).
-        use_auth_token (`Optional[str]`, defaults to `None`):
+        use_auth_token (Optional[Union[bool, str]], defaults to `None`):
+            Deprecated. Please use `token` instead.
+        token (Optional[Union[bool, str]], defaults to `None`):
             The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
-            when running `transformers-cli login` (stored in `~/.huggingface`).
+            when running `huggingface-cli login` (stored in `~/.huggingface`).
         model_kwargs (`Optional[Dict[str, Any]]`, defaults to `None`):
             Experimental usage: keyword arguments to pass to the model during
             the export. This argument should be used along the `custom_export_configs` argument
@@ -138,6 +158,15 @@ def main_export(
     ```
     """
 
+    if use_auth_token is not None:
+        warnings.warn(
+            "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
+            FutureWarning,
+        )
+        if token is not None:
+            raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
+        token = use_auth_token
+
     if compression_option is not None:
         logger.warning(
             "The `compression_option` argument is deprecated and will be removed in optimum-intel v1.17.0. "
@@ -161,29 +190,19 @@ def main_export(
             ov_config = OVConfig(quantization_config=q_config)
 
     original_task = task
-    task = TasksManager.map_from_synonym(task)
+    task = infer_task(task, model_name_or_path)
     framework = TasksManager.determine_framework(model_name_or_path, subfolder=subfolder, framework=framework)
+    library_name_is_not_provided = library_name is None
     library_name = TasksManager.infer_library_from_model(
         model_name_or_path, subfolder=subfolder, library_name=library_name
     )
 
-    if task == "auto":
-        try:
-            task = TasksManager.infer_task_from_model(model_name_or_path)
-        except KeyError as e:
-            raise KeyError(
-                f"The task could not be automatically inferred. Please provide the argument --task with the relevant task from {', '.join(TasksManager.get_all_tasks())}. Detailed error: {e}"
-            )
-        except RequestsConnectionError as e:
-            raise RequestsConnectionError(
-                f"The task could not be automatically inferred as this is available only for models hosted on the Hugging Face Hub. Please provide the argument --task with the relevant task from {', '.join(TasksManager.get_all_tasks())}. Detailed error: {e}"
-            )
-
-    if convert_tokenizer and not is_openvino_tokenizers_available():
+    if library_name == "sentence_transformers" and library_name_is_not_provided:
         logger.warning(
-            "`convert_tokenizer` requires openvino-tokenizers, please install it with `pip install optimum-intel[openvino-tokenizers]`"
+            "Library name is not specified. There are multiple possible variants: `sentence_tenasformers`, `transformers`."
+            "`transformers` will be selected. If you want to load your model with the `sentence-transformers` library instead, please set --library sentence_transformers"
         )
-        convert_tokenizer = False
+        library_name = "transformers"
 
     do_gptq_patching = False
     custom_architecture = False
@@ -194,7 +213,7 @@ def main_export(
             subfolder=subfolder,
             revision=revision,
             cache_dir=cache_dir,
-            use_auth_token=use_auth_token,
+            token=token,
             local_files_only=local_files_only,
             force_download=force_download,
             trust_remote_code=trust_remote_code,
@@ -202,9 +221,12 @@ def main_export(
         quantization_config = getattr(config, "quantization_config", None)
         do_gptq_patching = quantization_config and quantization_config["quant_method"] == "gptq"
         model_type = config.model_type.replace("_", "-")
-
         if model_type not in TasksManager._SUPPORTED_MODEL_TYPE:
             custom_architecture = True
+            if custom_export_configs is None:
+                raise ValueError(
+                    f"Trying to export a {model_type} model, that is a custom or unsupported architecture, but no custom export configuration was passed as `custom_export_configs`. Please refer to https://huggingface.co/docs/optimum/main/en/exporters/onnx/usage_guides/export_a_model#custom-export-of-transformers-models for an example on how to export custom models. Please open an issue at https://github.com/huggingface/optimum-intel/issues if you would like the model type {model_type} to be supported natively in the OpenVINO export."
+                )
         elif task not in TasksManager.get_supported_tasks_for_model_type(
             model_type, exporter="openvino", library_name=library_name
         ):
@@ -218,8 +240,23 @@ def main_export(
             raise ValueError(
                 f"Asked to export a {model_type} model for the task {task}{autodetected_message}, but the Optimum OpenVINO exporter only supports the tasks {', '.join(model_tasks.keys())} for {model_type}. Please use a supported task. Please open an issue at https://github.com/huggingface/optimum/issues if you would like the task {task} to be supported in the ONNX export for {model_type}."
             )
+
         if is_transformers_version(">=", "4.36") and model_type in SDPA_ARCHS_ONNX_EXPORT_NOT_SUPPORTED:
             loading_kwargs["attn_implementation"] = "eager"
+        # there are some difference between remote and in library representation of past key values for some models,
+        # for avoiding confusion we disable remote code for them
+        if (
+            trust_remote_code
+            and model_type in {"falcon", "mpt", "phi"}
+            and ("with-past" in task or original_task == "auto")
+            and not custom_export_configs
+        ):
+            logger.warning(
+                f"Model type `{model_type}` export for task `{task}` is not supported for loading with `trust_remote_code=True`"
+                "using default export configuration, `trust_remote_code` will be disabled. "
+                "Please provide custom export config if you want load model with remote code."
+            )
+            trust_remote_code = False
 
     # Patch the modules to export of GPTQ models w/o GPU
     if do_gptq_patching:
@@ -253,7 +290,7 @@ def main_export(
         subfolder=subfolder,
         revision=revision,
         cache_dir=cache_dir,
-        use_auth_token=use_auth_token,
+        token=token,
         local_files_only=local_files_only,
         force_download=force_download,
         trust_remote_code=trust_remote_code,
@@ -323,17 +360,39 @@ def main_export(
         fn_get_submodels=fn_get_submodels,
         preprocessors=preprocessors,
         device=device,
+        trust_remote_code=trust_remote_code,
         **kwargs_shapes,
     )
 
     if convert_tokenizer:
-        if library_name != "diffusers":
-            tokenizer = next(
-                (preprocessor for preprocessor in preprocessors if isinstance(preprocessor, PreTrainedTokenizerBase)),
-                None,
-            )
+        maybe_convert_tokenizers(library_name, output, model, preprocessors)
 
-            if tokenizer is not None:
+    # Unpatch modules after GPTQ export
+    if do_gptq_patching:
+        torch.cuda.is_available = orig_cuda_check
+        GPTQQuantizer.post_init_model = orig_post_init_model
+
+
+def maybe_convert_tokenizers(library_name: str, output: Path, model=None, preprocessors=None):
+    """
+    Tries to convert tokenizers to OV format and export them to disk.
+
+    Arguments:
+        library_name (`str`):
+            The library name.
+        output (`Path`):
+            Path to save converted tokenizers to.
+        model (`PreTrainedModel`, *optional*, defaults to None):
+            Model instance.
+        preprocessors (`Iterable`, *optional*, defaults to None):
+            Iterable possibly containing tokenizers to be converted.
+    """
+    from optimum.exporters.openvino.convert import export_tokenizer
+
+    if is_openvino_tokenizers_available():
+        if library_name != "diffusers" and preprocessors:
+            tokenizer = next(filter(lambda it: isinstance(it, PreTrainedTokenizerBase), preprocessors), None)
+            if tokenizer:
                 try:
                     export_tokenizer(tokenizer, output)
                 except Exception as exception:
@@ -341,16 +400,10 @@ def main_export(
                         "Could not load tokenizer using specified model ID or path. OpenVINO tokenizer/detokenizer "
                         f"models won't be generated. Exception: {exception}"
                     )
-        else:
-            tokenizer = getattr(model, "tokenizer", None)
-            if tokenizer is not None:
-                export_tokenizer(tokenizer, output)
-
-            tokenizer_2 = getattr(model, "tokenizer_2", None)
-            if tokenizer_2 is not None:
-                export_tokenizer(tokenizer_2, output, suffix="_2")
-
-    # Unpatch modules after GPTQ export
-    if do_gptq_patching:
-        torch.cuda.is_available = orig_cuda_check
-        GPTQQuantizer.post_init_model = orig_post_init_model
+        elif model:
+            for tokenizer_name in ("tokenizer", "tokenizer_2"):
+                tokenizer = getattr(model, tokenizer_name, None)
+                if tokenizer:
+                    export_tokenizer(tokenizer, output / tokenizer_name)
+    else:
+        logger.warning("Tokenizer won't be converted.")

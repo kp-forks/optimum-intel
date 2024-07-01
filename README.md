@@ -19,9 +19,9 @@ To install the latest release of 🤗 Optimum Intel with the corresponding requi
 
 | Accelerator                                                                                                      | Installation                                                         |
 |:-----------------------------------------------------------------------------------------------------------------|:---------------------------------------------------------------------|
-| [Intel Neural Compressor](https://www.intel.com/content/www/us/en/developer/tools/oneapi/neural-compressor.html) | `pip install --upgrade-strategy eager "optimum[neural-compressor]"`  |
-| [OpenVINO](https://docs.openvino.ai)                                                                             | `pip install --upgrade-strategy eager "optimum[openvino]"`           |
-| [Intel Extension for PyTorch](https://intel.github.io/intel-extension-for-pytorch/#introduction)                 | `pip install --upgrade-strategy eager "optimum[ipex]"`               |
+| [Intel Neural Compressor](https://www.intel.com/content/www/us/en/developer/tools/oneapi/neural-compressor.html) | `pip install --upgrade --upgrade-strategy eager "optimum[neural-compressor]"`  |
+| [OpenVINO](https://docs.openvino.ai)                                                                             | `pip install --upgrade --upgrade-strategy eager "optimum[openvino]"`           |
+| [Intel Extension for PyTorch](https://intel.github.io/intel-extension-for-pytorch/#introduction)                 | `pip install --upgrade --upgrade-strategy eager "optimum[ipex]"`               |
 
 The `--upgrade-strategy eager` option is needed to ensure `optimum-intel` is upgraded to the latest version.
 
@@ -78,10 +78,16 @@ It is possible to export your model to the [OpenVINO IR](https://docs.openvino.a
 optimum-cli export openvino --model gpt2 ov_model
 ```
 
-You can also apply 8-bit weight-only quantization when exporting your model : the model linear and embedding weights will be quantized to INT8, the activations will be kept in floating point precision.
+You can also apply 8-bit weight-only quantization when exporting your model : the model linear, embedding and convolution weights will be quantized to INT8, the activations will be kept in floating point precision.
 
 ```plain
 optimum-cli export openvino --model gpt2 --weight-format int8 ov_model
+```
+
+Quantization in hybrid mode can be applied to Stable Diffusion pipeline during model export. This involves applying hybrid post-training quantization to the UNet model and weight-only quantization for the rest of the pipeline components. In the hybrid mode, weights in MatMul and Embedding layers are quantized, as well as activations of other layers.
+
+```plain
+optimum-cli export openvino --model stabilityai/stable-diffusion-2-1 --dataset conceptual_captions --weight-format int8 ov_model
 ```
 
 To apply quantization on both weights and activations, you can find more information in the [documentation](https://huggingface.co/docs/optimum/main/en/intel/optimization_ov).
@@ -122,7 +128,7 @@ Post-training static quantization introduces an additional calibration step wher
 
 ```python
 from functools import partial
-from optimum.intel import OVQuantizer, OVModelForSequenceClassification
+from optimum.intel import OVQuantizer, OVModelForSequenceClassification, OVConfig, OVQuantizationConfig
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 model_id = "distilbert-base-uncased-finetuned-sst-2-english"
@@ -145,7 +151,8 @@ calibration_dataset = quantizer.get_calibration_dataset(
 # The directory where the quantized model will be saved
 save_dir = "nncf_results"
 # Apply static quantization and save the resulting model in the OpenVINO IR format
-quantizer.quantize(calibration_dataset=calibration_dataset, save_directory=save_dir)
+ov_config = OVConfig(quantization_config=OVQuantizationConfig())
+quantizer.quantize(ov_config=ov_config, calibration_dataset=calibration_dataset, save_directory=save_dir)
 # Load the quantized model
 optimized_model = OVModelForSequenceClassification.from_pretrained(save_dir)
 ```
@@ -202,6 +209,26 @@ Quantization aware training (QAT) is applied in order to simulate the effects of
 You can find more examples in the [documentation](https://huggingface.co/docs/optimum/intel/index).
 
 
+## IPEX
+To load your IPEX model, you can just replace your `AutoModelForXxx` class with the corresponding `IPEXModelForXxx` class. You can set `export=True` to load a PyTorch checkpoint, export your model via TorchScript and apply IPEX optimizations : both operators optimization (replaced with customized IPEX operators) and graph-level optimization (like operators fusion) will be applied on your model.
+```diff
+  from transformers import AutoTokenizer, pipeline
+- from transformers import AutoModelForCausalLM
++ from optimum.intel import IPEXModelForCausalLM
+
+
+  model_id = "gpt2"
+- model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
++ model = IPEXModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, export=True)
+  tokenizer = AutoTokenizer.from_pretrained(model_id)
+  pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+  results = pipe("He's a dreadful magician and")
+
+```
+
+For more details, please refer to the [documentation](https://intel.github.io/intel-extension-for-pytorch/#introduction).
+
+
 ## Running the examples
 
 Check out the [`examples`](https://github.com/huggingface/optimum-intel/tree/main/examples) directory to see how 🤗 Optimum Intel can be used to optimize models and accelerate inference.
@@ -212,3 +239,8 @@ Do not forget to install requirements for every example:
 cd <example-folder>
 pip install -r requirements.txt
 ```
+
+
+## Gaudi
+
+To train your model on [Intel Gaudi AI Accelerators (HPU)](https://docs.habana.ai/en/latest/index.html), check out [Optimum Habana](https://github.com/huggingface/optimum-habana) which provides a set of tools enabling easy model loading, training and inference on single- and multi-HPU settings for different downstream tasks. After training your model, feel free to submit it to the Intel [leaderboard](https://huggingface.co/spaces/Intel/powered_by_intel_llm_leaderboard) which is designed to evaluate, score, and rank open-source LLMs that have been pre-trained or fine-tuned on Intel Hardwares. Models submitted to the leaderboard will be evaluated on the Intel Developer Cloud. The evaluation platform consists of Gaudi Accelerators and Xeon CPUs running benchmarks from the Eleuther AI Language Model Evaluation Harness.

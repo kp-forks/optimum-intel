@@ -19,23 +19,47 @@ from packaging import version
 from transformers.utils import is_tf_available
 
 from optimum.exporters.onnx.config import TextDecoderOnnxConfig, TextDecoderWithPositionIdsOnnxConfig
-from optimum.exporters.onnx.model_configs import GemmaOnnxConfig
+from optimum.exporters.onnx.model_configs import (
+    CodeGenOnnxConfig,
+    FalconOnnxConfig,
+    GemmaOnnxConfig,
+    LlamaOnnxConfig,
+    MPTOnnxConfig,
+    PhiOnnxConfig,
+    UNetOnnxConfig,
+    VaeDecoderOnnxConfig,
+    VaeEncoderOnnxConfig,
+)
 from optimum.exporters.tasks import TasksManager
 from optimum.utils import DEFAULT_DUMMY_SHAPES
 from optimum.utils.input_generators import (
     DummyInputGenerator,
     DummyPastKeyValuesGenerator,
     DummyTextInputGenerator,
+    FalconDummyPastKeyValuesGenerator,
     MistralDummyPastKeyValuesGenerator,
 )
 from optimum.utils.normalized_config import NormalizedTextConfig
 
+from ...intel.utils.import_utils import _transformers_version, is_transformers_version
 from .model_patcher import (
+    AquilaModelPatcher,
+    ArcticModelPatcher,
     BaichuanModelPatcher,
     ChatGLMModelPatcher,
+    CodeGenModelPatcher,
+    DBRXModelPatcher,
     GemmaModelPatcher,
+    InternLM2Patcher,
+    InternLMModelPatcher,
+    JaisModelPatcher,
+    LlamaModelPatcher,
     MixtralModelPatcher,
+    MPTModelPatcher,
+    PersimmonModelPatcher,
+    Phi3ModelPatcher,
     QwenModelPatcher,
+    XverseModelPatcher,
 )
 
 
@@ -74,7 +98,7 @@ register_in_tasks_manager = TasksManager.create_register("openvino", overwrite_e
 
 
 @register_in_tasks_manager("baichuan", *["text-generation", "text-generation-with-past"], library_name="transformers")
-class BaichaunOpenVINOConfig(TextDecoderOnnxConfig):
+class BaichaunOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
     DEFAULT_ONNX_OPSET = 13
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig.with_args(
         num_layers="num_hidden_layers", num_attention_heads="num_attention_heads", hidden_size="hidden_size"
@@ -88,6 +112,15 @@ class BaichaunOpenVINOConfig(TextDecoderOnnxConfig):
 
 @register_in_tasks_manager("qwen2", *["text-generation", "text-generation-with-past"], library_name="transformers")
 class Qwen2OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, MistralDummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = MistralDummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+
+@register_in_tasks_manager("qwen2-moe", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class Qwen2MoEOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
     DEFAULT_ONNX_OPSET = 14
 
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, MistralDummyPastKeyValuesGenerator)
@@ -134,24 +167,27 @@ class ChatGLM2DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
         )
         self.multi_query_group_num = normalized_config.multi_query_group_num
         self.head_dim = normalized_config.kv_channels
+        self.standart_cache_layout = hasattr(normalized_config, "rope_ratio")
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        past_key_shape = (
-            self.sequence_length,
-            self.batch_size,
-            self.multi_query_group_num,
-            self.head_dim,
-        )
-        past_value_shape = (
-            self.sequence_length,
-            self.batch_size,
-            self.multi_query_group_num,
-            self.head_dim,
-        )
+        if not self.standart_cache_layout:
+            pkv_shape = (
+                self.sequence_length,
+                self.batch_size,
+                self.multi_query_group_num,
+                self.head_dim,
+            )
+        else:
+            pkv_shape = (
+                self.batch_size,
+                self.multi_query_group_num,
+                self.sequence_length,
+                self.head_dim,
+            )
         return [
             (
-                self.random_float_tensor(past_key_shape, framework=framework, dtype=float_dtype),
-                self.random_float_tensor(past_value_shape, framework=framework, dtype=float_dtype),
+                self.random_float_tensor(pkv_shape, framework=framework, dtype=float_dtype),
+                self.random_float_tensor(pkv_shape, framework=framework, dtype=float_dtype),
             )
             for _ in range(self.num_layers)
         ]
@@ -196,7 +232,10 @@ class ChatGLM2OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
             and "attention_mask" in dummy_inputs
         ):
             # Obtain the past sequence length from the value instead of the key (Bloom). ChatGLM has seq_len in 0 dim instead of -2
-            past_present_length = dummy_inputs["input_ids"].shape[1] + dummy_inputs["past_key_values"][0][1].shape[0]
+            seq_len_dim = 0 if not hasattr(self._normalized_config, "rope_ratio") else -2
+            past_present_length = (
+                dummy_inputs["input_ids"].shape[1] + dummy_inputs["past_key_values"][0][1].shape[seq_len_dim]
+            )
 
             dummy_inputs["attention_mask"] = DummyInputGenerator.pad_input_on_dim(
                 dummy_inputs["attention_mask"],
@@ -227,9 +266,18 @@ class ChatGLM2OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
             decoder_sequence_name = "past_sequence_length + present_lenght"
             name = "present"
 
+        is_v4 = hasattr(self._normalized_config, "rope_ratio")
         for i in range(self._normalized_config.num_layers):
-            inputs_or_outputs[f"{name}.{i}.key"] = {1: "batch_size", 0: decoder_sequence_name}
-            inputs_or_outputs[f"{name}.{i}.value"] = {1: "batch_size", 0: decoder_sequence_name}
+            inputs_or_outputs[f"{name}.{i}.key"] = (
+                {1: "batch_size", 0: decoder_sequence_name}
+                if not is_v4
+                else {0: "batch_size", 2: decoder_sequence_name}
+            )
+            inputs_or_outputs[f"{name}.{i}.value"] = (
+                {1: "batch_size", 0: decoder_sequence_name}
+                if not is_v4
+                else {0: "batch_size", 2: decoder_sequence_name}
+            )
 
     def patch_model_for_export(
         self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
@@ -272,6 +320,24 @@ class GemmaOpenVINOConfig(GemmaOnnxConfig):
         self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
     ) -> "ModelPatcher":
         return GemmaModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager(
+    "llama",
+    *[
+        "feature-extraction",
+        "feature-extraction-with-past",
+        "text-generation",
+        "text-generation-with-past",
+        "text-classification",
+    ],
+    library_name="transformers",
+)
+class LlamaOpenVINOConfig(LlamaOnnxConfig):
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return LlamaModelPatcher(self, model, model_kwargs=model_kwargs)
 
 
 class QwenDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
@@ -400,3 +466,377 @@ class Starcoder2OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, MistralDummyPastKeyValuesGenerator)
     DUMMY_PKV_GENERATOR_CLASS = MistralDummyPastKeyValuesGenerator
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+
+@register_in_tasks_manager("internlm2", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class InternLM2OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, MistralDummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = MistralDummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return InternLM2Patcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager("orion", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class OrionOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, MistralDummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = MistralDummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+
+@register_in_tasks_manager("olmo", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class OlmoOpenVINOConfig(LlamaOpenVINOConfig):
+    DEFAULT_ONNX_OPSET = 14
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+
+@register_in_tasks_manager(
+    "mpt", *["text-generation", "text-generation-with-past", "text-classification"], library_name="transformers"
+)
+class MPTOpenVINOConfig(MPTOnnxConfig):
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return MPTModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager(
+    "phi3",
+    *[
+        "feature-extraction",
+        "feature-extraction-with-past",
+        "text-generation",
+        "text-generation-with-past",
+        "text-classification",
+    ],
+    library_name="transformers",
+)
+class Phi3OpenVINOConfig(PhiOnnxConfig):
+    DUMMY_INPUT_GENERATOR_CLASSES = (
+        MistralDummyPastKeyValuesGenerator,
+    ) + TextDecoderOnnxConfig.DUMMY_INPUT_GENERATOR_CLASSES
+    DUMMY_PKV_GENERATOR_CLASS = MistralDummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig.with_args(num_key_value_heads="num_key_value_heads", allow_new=True)
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return Phi3ModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+class OVFalconDummyPastKeyValuesGenerator(FalconDummyPastKeyValuesGenerator):
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedTextConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        random_batch_size_range: Optional[Tuple[int, int]] = None,
+        random_sequence_length_range: Optional[Tuple[int, int]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            task=task,
+            normalized_config=normalized_config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            random_batch_size_range=random_batch_size_range,
+            random_sequence_length_range=random_sequence_length_range,
+            **kwargs,
+        )
+        if normalized_config.new_decoder_architecture:
+            self.num_kv_heads = normalized_config.num_attention_heads
+        else:
+            self.num_kv_heads = normalized_config.num_kv_heads if not normalized_config.multi_query else 1
+
+        self.head_dim = self.hidden_size // self.num_attention_heads
+
+
+@register_in_tasks_manager(
+    "falcon",
+    *[
+        "feature-extraction",
+        "feature-extraction-with-past",
+        "question-answering",
+        "text-generation",
+        "text-generation-with-past",
+        "token-classification",
+    ],
+    library_name="transformers",
+)
+class FalconOpenVINOConfig(FalconOnnxConfig):
+    DUMMY_INPUT_GENERATOR_CLASSES = (
+        OVFalconDummyPastKeyValuesGenerator,
+    ) + TextDecoderOnnxConfig.DUMMY_INPUT_GENERATOR_CLASSES
+    DUMMY_PKV_GENERATOR_CLASS = OVFalconDummyPastKeyValuesGenerator
+
+
+@register_in_tasks_manager("unet", *["semantic-segmentation"], library_name="diffusers")
+class UNetOpenVINOConfig(UNetOnnxConfig):
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        common_inputs = {
+            "sample": {0: "batch_size", 2: "height", 3: "width"},
+            "timestep": {0: "steps"},
+            "encoder_hidden_states": {0: "batch_size", 1: "sequence_length"},
+        }
+
+        # TODO : add text_image, image and image_embeds
+        if getattr(self._normalized_config, "addition_embed_type", None) == "text_time":
+            common_inputs["text_embeds"] = {0: "batch_size"}
+            common_inputs["time_ids"] = {0: "batch_size"}
+
+        if getattr(self._normalized_config, "time_cond_proj_dim", None) is not None:
+            common_inputs["timestep_cond"] = {0: "batch_size"}
+        return common_inputs
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "out_sample": {0: "batch_size", 2: "height", 3: "width"},
+        }
+
+
+@register_in_tasks_manager("vae-encoder", *["semantic-segmentation"], library_name="diffusers")
+class VaeEncoderOpenVINOConfig(VaeEncoderOnnxConfig):
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "sample": {0: "batch_size", 2: "height", 3: "width"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "latent_sample": {0: "batch_size", 2: "height_latent", 3: "width_latent"},
+        }
+
+
+@register_in_tasks_manager("vae-decoder", *["semantic-segmentation"], library_name="diffusers")
+class VaeDecoderOpenVINOConfig(VaeDecoderOnnxConfig):
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "latent_sample": {0: "batch_size", 2: "height_latent", 3: "width_latent"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "sample": {0: "batch_size", 2: "height", 3: "width"},
+        }
+
+
+@register_in_tasks_manager(
+    "persimmon",
+    *[
+        "feature-extraction",
+        "feature-extraction-with-past",
+        "text-generation",
+        "text-generation-with-past",
+        "text-classification",
+    ],
+    library_name="transformers",
+)
+class PersimmonOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return PersimmonModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager("biogpt", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class BioGPTOpenVINOConfig(TextDecoderOnnxConfig):
+    # BioGPT does not require position_ids input.
+    DEFAULT_ONNX_OPSET = 13
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+
+@register_in_tasks_manager(
+    "gpt-neox-japanese", *["text-generation", "text-generation-with-past"], library_name="transformers"
+)
+class GPTNeoxJapaneseOpenVINOConfig(TextDecoderOnnxConfig):
+    # GPTNeoxJapanese does not require position_ids input.
+    DEFAULT_ONNX_OPSET = 13
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+
+@register_in_tasks_manager(
+    "cohere",
+    *[
+        "feature-extraction",
+        "feature-extraction-with-past",
+        "text-generation",
+        "text-generation-with-past",
+        "text-classification",
+    ],
+    library_name="transformers",
+)
+class CohereOpenVINOConfig(LlamaOpenVINOConfig):
+    pass
+
+
+@register_in_tasks_manager("xglm", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class XGLMConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 13
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig.with_args(
+        num_attention_heads="attention_heads", hidden_size="d_model"
+    )
+
+
+class AquilaDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedTextConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        random_batch_size_range: Optional[Tuple[int, int]] = None,
+        random_sequence_length_range: Optional[Tuple[int, int]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            task,
+            normalized_config,
+            batch_size,
+            sequence_length,
+            random_batch_size_range,
+            random_sequence_length_range,
+            **kwargs,
+        )
+        self.num_key_value_heads = getattr(
+            normalized_config, "num_key_value_heads", normalized_config.num_attention_heads
+        )
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        shape = (
+            self.batch_size,
+            self.num_key_value_heads,
+            self.sequence_length,
+            self.hidden_size // self.num_attention_heads,
+        )
+        return [
+            (
+                self.random_float_tensor(shape, framework=framework, dtype=float_dtype),
+                self.random_float_tensor(shape, framework=framework, dtype=float_dtype),
+            )
+            for _ in range(self.num_layers)
+        ]
+
+
+@register_in_tasks_manager("aquila", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class AquilaMOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, AquilaDummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = AquilaDummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig.with_args(num_key_value_heads="num_key_value_heads", allow_new=True)
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return AquilaModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager("xverse", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class XverseMOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, DummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = DummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return XverseModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager("internlm", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class InternLMOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, DummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = DummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return InternLMModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager(
+    "codegen",
+    *["feature-extraction", "feature-extraction-with-past", "text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+class CodeGenOpenVINOConfig(CodeGenOnnxConfig):
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return CodeGenModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager(
+    "dbrx",
+    *["text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+class DBRXOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig.with_args(
+        num_attention_heads="n_heads",
+        hidden_size="d_model",
+        num_layers="n_layers",
+        num_key_value_heads="attn_config.kv_n_heads",
+        allow_new=True,
+    )
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, MistralDummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = MistralDummyPastKeyValuesGenerator
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return DBRXModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager(
+    "jais",
+    *["text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+class JaisOpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, DummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = DummyPastKeyValuesGenerator
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        return JaisModelPatcher(self, model, model_kwargs=model_kwargs)
+
+
+@register_in_tasks_manager("arctic", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class ArcticOpenVINOConfig(MixtralOpenVINOConfig):
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ) -> "ModelPatcher":
+        if is_transformers_version("<=", "4.36.0"):
+            raise ValueError(
+                f"Model patching for Arctic models only available for transformers >= v4.37.0, found {_transformers_version}"
+            )
+
+        return ArcticModelPatcher(self, model, model_kwargs=model_kwargs)

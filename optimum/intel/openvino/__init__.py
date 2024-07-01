@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import logging
+import warnings
 
 from ..utils.import_utils import is_accelerate_available, is_diffusers_available, is_nncf_available
 from .utils import (
@@ -25,8 +26,14 @@ from .utils import (
 )
 
 
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+
 if is_nncf_available():
+    logging.disable(logging.INFO)
     import nncf
+
+    logging.disable(logging.NOTSET)
 
     # Suppress version mismatch logging
     nncf.set_log_level(logging.ERROR)
@@ -43,12 +50,13 @@ if is_nncf_available():
         from .trainer import OVTrainer
 
 
-from .configuration import OVConfig, OVWeightQuantizationConfig
+from .configuration import OVConfig, OVDynamicQuantizationConfig, OVQuantizationConfig, OVWeightQuantizationConfig
 from .modeling import (
     OVModelForAudioClassification,
     OVModelForAudioFrameClassification,
     OVModelForAudioXVector,
     OVModelForCTC,
+    OVModelForCustomTasks,
     OVModelForFeatureExtraction,
     OVModelForImageClassification,
     OVModelForMaskedLM,
@@ -57,7 +65,7 @@ from .modeling import (
     OVModelForTokenClassification,
 )
 from .modeling_decoder import OVModelForCausalLM
-from .modeling_seq2seq import OVModelForPix2Struct, OVModelForSeq2SeqLM, OVModelForSpeechSeq2Seq
+from .modeling_seq2seq import OVModelForPix2Struct, OVModelForSeq2SeqLM, OVModelForSpeechSeq2Seq, OVModelForVision2Seq
 
 
 if is_diffusers_available():

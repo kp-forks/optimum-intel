@@ -14,12 +14,14 @@
 
 import logging
 import os
+import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
 from typing import Dict, Optional, Union
 
 import openvino
 from huggingface_hub import hf_hub_download
+from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 from openvino import Core, convert_model
 from openvino._offline_transformations import apply_moc_transformations, compress_model_transformation
 from transformers import GenerationConfig, PretrainedConfig
@@ -31,7 +33,7 @@ from optimum.modeling_base import OptimizedModel
 
 from ...exporters.openvino import export, main_export
 from ..utils.import_utils import is_nncf_available
-from .configuration import OVConfig, OVWeightQuantizationConfig
+from .configuration import OVConfig, OVDynamicQuantizationConfig, OVWeightQuantizationConfig
 from .utils import ONNX_WEIGHTS_NAME, OV_XML_FILE_NAME, _print_compiled_model_properties
 
 
@@ -64,7 +66,7 @@ class OVBaseModel(OptimizedModel):
         self.model_save_dir = model_save_dir
         self._device = device.upper()
         self.is_dynamic = dynamic_shapes
-        self.ov_config = ov_config if ov_config is not None else {"PERFORMANCE_HINT": "LATENCY"}
+        self.ov_config = {} if ov_config is None else {**ov_config}
         self.preprocessors = kwargs.get("preprocessors", [])
         enable_compilation = kwargs.get("compile", True)
 
@@ -87,23 +89,32 @@ class OVBaseModel(OptimizedModel):
 
         self.model = model
         self.request = None
-        if enable_compilation:
-            self.compile()
-
-        self.generation_config = GenerationConfig.from_model_config(config) if self.can_generate() else None
+        if self.can_generate():
+            self.generation_config = kwargs.get("generation_config", GenerationConfig.from_model_config(config))
+        else:
+            self.generation_config = None
 
         self._openvino_config = None
         if quantization_config:
             self._openvino_config = OVConfig(quantization_config=quantization_config)
+        self._set_ov_config_parameters()
+
+        if enable_compilation:
+            self.compile()
 
     @staticmethod
-    def load_model(file_name: Union[str, Path], quantization_config: Union[OVWeightQuantizationConfig, Dict] = None):
+    def load_model(
+        file_name: Union[str, Path],
+        quantization_config: Union[OVWeightQuantizationConfig, Dict] = None,
+    ):
         """
         Loads the model.
 
         Arguments:
             file_name (`str` or `Path`):
                 The path of the model ONNX or XML file.
+            quantization_config (`OVWeightQuantizationConfig` or `Dict`, *optional*):
+                Quantization config to apply after model is loaded.
         """
 
         def fix_op_names_duplicates(model: openvino.runtime.Model):
@@ -124,6 +135,7 @@ class OVBaseModel(OptimizedModel):
         if file_name.suffix == ".onnx":
             model = fix_op_names_duplicates(model)  # should be called during model conversion to IR
 
+        # TODO: remove this way of applying quantization; instead apply it after instance of OVModel* is loaded
         if quantization_config:
             if not is_nncf_available():
                 raise ImportError(
@@ -147,6 +159,14 @@ class OVBaseModel(OptimizedModel):
         """
         dst_path = os.path.join(save_directory, OV_XML_FILE_NAME)
         openvino.save_model(self.model, dst_path, compress_to_fp16=False)
+        generation_config = getattr(self, "generation_config", None)
+        if generation_config is not None:
+            try:
+                generation_config.save_pretrained(save_directory)
+            except Exception as exception:
+                logger.warning(
+                    f"The generation config will not be saved, saving failed with following error:\n{exception}"
+                )
 
         self._save_openvino_config(save_directory)
 
@@ -162,10 +182,11 @@ class OVBaseModel(OptimizedModel):
         cls,
         model_id: Union[str, Path],
         config: PretrainedConfig,
-        use_auth_token: Optional[Union[bool, str, None]] = None,
-        revision: Optional[Union[str, None]] = None,
+        use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
+        revision: Optional[str] = None,
         force_download: bool = False,
-        cache_dir: Optional[str] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
         file_name: Optional[str] = None,
         subfolder: str = "",
         from_onnx: bool = False,
@@ -183,9 +204,11 @@ class OVBaseModel(OptimizedModel):
                 Can be either:
                     - The model id of a pretrained model hosted inside a model repo on huggingface.co.
                     - The path to a directory containing the model weights.
-            use_auth_token (`str` or `bool`):
-                The token to use as HTTP bearer authorization for remote files. Needed to load models from a private
-                repository.
+            use_auth_token (Optional[Union[bool, str]], defaults to `None`):
+                Deprecated. Please use `token` instead.
+            token (Optional[Union[bool, str]], defaults to `None`):
+                The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
+                when running `huggingface-cli login` (stored in `~/.huggingface`).
             revision (`str`, *optional*):
                 The specific model version to use. It can be a branch name, a tag name, or a commit id.
             cache_dir (`Union[str, Path]`, *optional*):
@@ -202,13 +225,22 @@ class OVBaseModel(OptimizedModel):
             load_in_8bit (`bool`, *optional*, defaults to `False`):
                 Whether or not to apply 8-bit weight quantization.
         """
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
+                FutureWarning,
+            )
+            if token is not None:
+                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
+            token = use_auth_token
+
         model_path = Path(model_id)
         default_file_name = ONNX_WEIGHTS_NAME if from_onnx else OV_XML_FILE_NAME
         file_name = file_name or default_file_name
 
         model_cache_path = cls._cached_file(
             model_path=model_path,
-            use_auth_token=use_auth_token,
+            token=token,
             revision=revision,
             force_download=force_download,
             cache_dir=cache_dir,
@@ -220,6 +252,20 @@ class OVBaseModel(OptimizedModel):
         quantization_config = cls._prepare_weight_quantization_config(quantization_config, load_in_8bit)
 
         model = cls.load_model(model_cache_path, quantization_config=quantization_config)
+
+        try:
+            generation_config = GenerationConfig.from_pretrained(
+                model_id,
+                token=token,
+                revision=revision,
+                subfolder=subfolder,
+                force_download=force_download,
+                cache_dir=cache_dir,
+            )
+            kwargs["generation_config"] = generation_config
+        except Exception:
+            pass
+
         return cls(
             model,
             config=config,
@@ -240,10 +286,21 @@ class OVBaseModel(OptimizedModel):
 
         return quantization_config
 
+    def _set_ov_config_parameters(self):
+        if self.ov_config.get("PERFORMANCE_HINT") is None:
+            self.ov_config["PERFORMANCE_HINT"] = "LATENCY"
+
+        q_config = self._openvino_config.quantization_config if self._openvino_config else None
+        if isinstance(q_config, OVDynamicQuantizationConfig):
+            self.ov_config["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = str(q_config.activations_group_size)
+            if self.can_generate() and "KV_CACHE_PRECISION" not in self.ov_config:
+                self.ov_config["KV_CACHE_PRECISION"] = "u8"
+
     @staticmethod
     def _cached_file(
         model_path: Union[Path, str],
         use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
         revision: Optional[str] = None,
         force_download: bool = False,
         cache_dir: Optional[str] = None,
@@ -251,6 +308,15 @@ class OVBaseModel(OptimizedModel):
         subfolder: str = "",
         local_files_only: bool = False,
     ):
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
+                FutureWarning,
+            )
+            if token is not None:
+                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
+            token = use_auth_token
+
         # locates a file in a local folder and repo, downloads and cache it if necessary.
         model_path = Path(model_path)
         if model_path.is_dir():
@@ -266,7 +332,7 @@ class OVBaseModel(OptimizedModel):
                     repo_id=model_path.as_posix(),
                     filename=file_name.as_posix(),
                     subfolder=subfolder,
-                    use_auth_token=use_auth_token,
+                    token=token,
                     revision=revision,
                     cache_dir=cache_dir,
                     force_download=force_download,
@@ -282,9 +348,10 @@ class OVBaseModel(OptimizedModel):
         model_id: str,
         config: PretrainedConfig,
         use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
         revision: Optional[str] = None,
         force_download: bool = False,
-        cache_dir: Optional[str] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
         subfolder: str = "",
         local_files_only: bool = False,
         task: Optional[str] = None,
@@ -304,15 +371,30 @@ class OVBaseModel(OptimizedModel):
                     - The path to a directory containing the model weights.            save_dir (`str` or `Path`):
                 The directory where the exported ONNX model should be saved, default to
                 `transformers.file_utils.default_cache_path`, which is the cache directory for transformers.
-            use_auth_token (`str` or `bool`):
-                Is needed to load models from a private repository
+            use_auth_token (`Optional[str]`, defaults to `None`):
+                Deprecated. Please use `token` instead.
+            token (Optional[Union[bool, str]], defaults to `None`):
+                The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
+                when running `huggingface-cli login` (stored in `~/.huggingface`).
             revision (`str`):
                 Revision is the specific model version to use. It can be a branch name, a tag name, or a commit id
             kwargs (`Dict`, *optional*):
                 kwargs will be passed to the model during initialization
         """
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
+                FutureWarning,
+            )
+            if token is not None:
+                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
+            token = use_auth_token
+
         save_dir = TemporaryDirectory()
         save_dir_path = Path(save_dir.name)
+        # This attribute is needed to keep one reference on the temporary directory, since garbage collecting
+        # would end-up removing the directory containing the underlying OpenVINO model
+        cls._model_save_dir_tempdirectory_instance = save_dir
 
         # If load_in_8bit and quantization_config not specified then ov_config is set to None and will be set by default in convert depending on the model size
         if load_in_8bit is None and not quantization_config:
@@ -327,7 +409,7 @@ class OVBaseModel(OptimizedModel):
             subfolder=subfolder,
             revision=revision,
             cache_dir=cache_dir,
-            use_auth_token=use_auth_token,
+            token=token,
             local_files_only=local_files_only,
             force_download=force_download,
             trust_remote_code=trust_remote_code,
@@ -350,13 +432,23 @@ class OVBaseModel(OptimizedModel):
         config: PretrainedConfig,
         onnx_config: OnnxConfig,
         use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
         revision: Optional[str] = None,
         force_download: bool = False,
-        cache_dir: Optional[str] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
         local_files_only: bool = False,
         stateful: bool = False,
         **kwargs,
     ):
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
+                FutureWarning,
+            )
+            if token is not None:
+                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
+            token = use_auth_token
+
         save_dir = TemporaryDirectory()
         save_dir_path = Path(save_dir.name)
 
@@ -373,7 +465,7 @@ class OVBaseModel(OptimizedModel):
             model_id=save_dir_path,
             config=config,
             from_onnx=False,
-            use_auth_token=use_auth_token,
+            token=token,
             revision=revision,
             force_download=force_download,
             cache_dir=cache_dir,
@@ -461,3 +553,27 @@ class OVBaseModel(OptimizedModel):
         if isinstance(self, GenerationMixin):
             return True
         return False
+
+    def _inference(self, inputs):
+        try:
+            outputs = self.request(inputs)
+        except Exception as e:
+            invalid_inputs_msg = self._incompatible_inputs_warning(inputs)
+            if invalid_inputs_msg is not None:
+                e.args += (invalid_inputs_msg,)
+            raise e
+        return outputs
+
+    def _incompatible_inputs_warning(self, inputs: Dict):
+        expected_inputs_names = set(self.input_names.keys())
+        inputs_names = set(inputs.keys())
+
+        if expected_inputs_names != inputs_names:
+            return f"Got unexpected inputs: expecting the following inputs {expected_inputs_names} but got {inputs_names}."
+
+        for input_name in inputs:
+            if inputs[input_name] is None:
+                dtype = self.request.inputs[self.input_names[input_name]].get_element_type()
+                return f"Got unexpected inputs: `{input_name}` set to {type(inputs[input_name])} while expected to be {dtype}."
+
+        return None
